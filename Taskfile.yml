@@ -797,6 +797,20 @@ tasks:
           WORKDIR: '{{ .ROOT_DIR }}'
           KUBECONFIG_PATH: '{{ .OLM_KUBECONFIG_PATH }}'
 
+  olm:bundle:
+    desc: Generate, build, push and validate the OLM bundle
+    requires:
+      vars:
+        - name: ENVIRONMENT
+          enum:
+            ref: .ALLOWED_ENVS
+    cmds:
+      - if: '{{ not .GITHUB_ACTIONS }}'
+        task: olm:setup-internal-infra
+      - task: olm:bundle:generate
+      - task: olm:build
+      - task: olm:validate
+
   olm:manifest:
     run: once
     internal: true
@@ -870,8 +884,9 @@ tasks:
     generates:
       - operator/olm-manifests/manifest.yaml
 
-  olm:bundle:
+  olm:bundle:generate:
     desc: Generate the OLM bundle for the operator
+    internal: true
     summary: |
       Note that --use-image-digests makes operator-sdk resolve every image in
       the CSV against its registry, so the operator image for this ref must
@@ -895,60 +910,72 @@ tasks:
             ref: .ALLOWED_ENVS
     deps:
       - olm:manifest
-    env:
-      use_image_digests: '{{ if and .GITHUB_ACTIONS (not .SKIP_IMAGE_DIGESTS) }}--use-image-digests{{ end }}'
     cmds:
-      - >
-        docker
-        run --rm
-        -u $(id -u)
-        -v $(pwd)/operator:/operator
-        -w /operator/
-        quay.io/operator-framework/operator-sdk:{{ .OPERATOR_SDK_IMAGE_VERSION }}
-        generate bundle
-        --input-dir olm-manifests/
-        --kustomize-dir config/manifests
-        --package klio-operator
-        --channels {{ .OLM_CHANNELS }}
-        --default-channel {{ .OLM_DEFAULT_CHANNEL }}
-        ${use_image_digests}
-        --version {{ .GIT_TAG_VERSION }}
+      # The bundle version is not passed: bundle:generate derives it from
+      # `git describe` the same way GIT_TAG_VERSION does.
+      - task: ci-machinery-olm:bundle:generate
+        vars:
+          WORKDIR: '{{ .ROOT_DIR }}/operator'
+          INPUT_DIR: 'olm-manifests'
+          PACKAGE_NAME: 'klio-operator'
+          EXTRA_ARGS: '{{ if and .GITHUB_ACTIONS (not .SKIP_IMAGE_DIGESTS) }}--use-image-digests{{ end }}'
+          CHANNELS: '{{ .OLM_CHANNELS }}'
+          DEFAULT_CHANNEL: '{{ .OLM_DEFAULT_CHANNEL }}'
       - |
         printf '\n  # OpenShift annotations.\n  com.redhat.openshift.versions: "%s"\n' \
-          '{{ .OPENSHIFT_VERSIONS }}' >> operator/bundle/metadata/annotations.yaml
+          '{{ .OPENSHIFT_VERSIONS }}' >> operator/olm-bundle/bundle/metadata/annotations.yaml
         printf '\n# OpenShift labels.\nLABEL com.redhat.openshift.versions="%s"\n' \
-          '{{ .OPENSHIFT_VERSIONS }}' >> operator/bundle.Dockerfile
+          '{{ .OPENSHIFT_VERSIONS }}' >> operator/olm-bundle/bundle.Dockerfile
     sources:
       - operator/olm-manifests/**
     generates:
-      - operator/bundle/**
+      - operator/olm-bundle/**
 
   olm:build:
-    desc: Build the require OLM bundle image after generating the bundle
+    desc: Build and push the require OLM bundle image after generating the bundle
+    internal: true
     requires:
       vars:
         - name: ENVIRONMENT
           enum:
             ref: .ALLOWED_ENVS
     deps:
-      - internal:create-builder
-      - internal:registry-network-connect
-      - olm:bundle
-    env:
-      registry: '{{ if .GITHUB_ACTIONS }}ghcr.io/{{ .REGISTRY_OWNER }}{{ else }}{{ .REGISTRY_NAME }}:{{ .REGISTRY_PORT }}{{ end }}'
-      insecure: '{{ if .GITHUB_ACTIONS }}false{{ else }}true{{ end }}'
-      suffix: '{{ if ( ne .ENVIRONMENT "production" ) }}-testing{{end}}'
-      tag: '{{ .TAG | default .IMAGE_TAG }}'
+      - olm:bundle:generate
     cmds:
-      - >
-        docker buildx build
-        --builder {{ .BUILDER_NAME }}
-        --push
-        --platform linux/amd64,linux/arm64
-        -t ${registry}/klio-operator${suffix}:${tag}-bundle
-        -f operator/bundle.Dockerfile
-        --output="type=image,registry.insecure=${insecure}"
-        operator/
+      # bundle:image pushes through the ci-machinery builder, whose buildkitd
+      # config already trusts the local registry, so there is no insecure
+      # registry option to pass.
+      - task: ci-machinery-olm:bundle:image
+        vars:
+          WORKDIR: '{{ .ROOT_DIR }}/operator'
+          BUNDLE_DIR: 'olm-bundle'
+          IMAGE_REGISTRY: '{{ if .GITHUB_ACTIONS }}ghcr.io/{{ .REGISTRY_OWNER }}{{ else }}{{ .REGISTRY_NAME }}:{{ .REGISTRY_PORT }}{{ end }}'
+          IMAGE_NAME: 'klio-operator{{ if ( ne .ENVIRONMENT "production" ) }}-testing{{end}}'
+          IMAGE_TAG: '{{ .TAG | default .IMAGE_TAG }}-bundle'
+          PLATFORMS: 'linux/amd64,linux/arm64'
+
+  olm:validate:
+    desc: Validate the OLM bundle image with operator-sdk
+    summary: |
+      Runs `operator-sdk bundle validate` against the pushed bundle image,
+      including the optional operatorframework suite.
+    internal: true
+    requires:
+      vars:
+        - name: ENVIRONMENT
+          enum:
+            ref: .ALLOWED_ENVS
+    deps:
+      - olm:build
+    vars:
+      image_registry: '{{ if .GITHUB_ACTIONS }}ghcr.io/{{ .REGISTRY_OWNER }}{{ else }}{{ .REGISTRY_NAME }}:{{ .REGISTRY_PORT }}{{ end }}'
+      image_name: 'klio-operator{{ if ( ne .ENVIRONMENT "production" ) }}-testing{{end}}'
+      image_tag: '{{ .TAG | default .IMAGE_TAG }}-bundle'
+    cmds:
+      - task: ci-machinery-olm:bundle:validate
+        vars:
+          BUNDLE_IMAGE: '{{ .image_registry }}/{{ .image_name }}:{{ .image_tag }}'
+          EXTRA_ARGS: '--select-optional suite=operatorframework --output=json-alpha1'
 
   olm:catalog-file:
     internal: false
