@@ -5,6 +5,9 @@ version: 3.54.0
 # what task is writing.
 output: prefixed
 
+includes:
+  ci-machinery-olm: https://raw.githubusercontent.com/cloudnative-pg/ci-machinery/refs/heads/main/taskfiles/taskfile.olm.yaml
+
 vars:
   BUILDER_NAME: klio-builder
   REGISTRY_CERT_VOLUME: certs-klio
@@ -51,6 +54,11 @@ vars:
   # offer an upgrade from any earlier release (see olm:manifest). Never lower
   # it, and only raise it if a version range is ever declared unupgradable.
   OLM_FIRST_BUNDLE_VERSION: '0.0.21'
+  # Kind cluster the OLM tests (olm:scorecard, olm:test-catalog) run on, and
+  # where its kubeconfig is exported. Kept apart from KIND_CLUSTER_NAME, which
+  # the e2e tests read from the environment.
+  OLM_KIND_CLUSTER_NAME: '{{ .OLM_KIND_CLUSTER_NAME | default "klio-olm-test" }}'
+  OLM_KUBECONFIG_PATH: './{{ .OLM_KIND_CLUSTER_NAME }}-kubeconfig'
   # Set to a non-empty value to build the OLM bundle without pinning images to
   # digests. Defaults to empty, so digest pinning is on wherever it can work;
   # see olm:bundle for when CI turns it off.
@@ -764,6 +772,30 @@ tasks:
       - olm:catalog
       - olm:catalog-source
       - olm:scorecard
+
+  olm:setup-internal-infra:
+    desc: Set up the registry, builder, Dagger engine and Kind cluster for the OLM tests
+    summary: |
+      Starts the ci-machinery infrastructure the OLM tests run on: a local
+      registry, a buildx builder and a Dagger engine sharing one Docker
+      network, plus a Kind cluster named OLM_KIND_CLUSTER_NAME (default
+      "klio-olm-test"). Every step is skipped when already up.
+    run: once
+    cmds:
+      - task: ci-machinery-olm:infra:setup-container-registry
+        vars:
+          REGISTRY_HOST_PORT: '5005'
+      - task: ci-machinery-olm:infra:setup-docker-builder
+      - task: ci-machinery-olm:infra:setup-kind
+        vars:
+          CLUSTER_NAME: '{{ .OLM_KIND_CLUSTER_NAME }}'
+      - task: ci-machinery-olm:infra:export-kubeconfig
+        vars:
+          CLUSTER_NAME: '{{ .OLM_KIND_CLUSTER_NAME }}'
+          # The OLM tasks reach the cluster from inside the Dagger engine.
+          INTERNAL: 'true'
+          WORKDIR: '{{ .ROOT_DIR }}'
+          KUBECONFIG_PATH: '{{ .OLM_KUBECONFIG_PATH }}'
 
   olm:manifest:
     run: once

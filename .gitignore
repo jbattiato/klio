@@ -1,6 +1,7 @@
 .idea
 .task
 kubeconfig-integration
+klio-olm-test-kubeconfig
 
 # Test registry certificates
 certs/
